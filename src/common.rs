@@ -3009,37 +3009,38 @@ mod tests {
 
     #[test]
     fn test_is_public() {
-        // Test URLs containing "rustdesk.com/"
-        assert!(is_public("https://rustdesk.com/"));
-        assert!(is_public("https://www.rustdesk.com/"));
-        assert!(is_public("https://api.rustdesk.com/v1"));
-        assert!(is_public("https://API.RUSTDESK.COM/v1"));
-        assert!(is_public("https://rustdesk.com/path"));
+        // Test URLs containing "rust.ayypd.cn/"
+        assert!(is_public("https://rust.ayypd.cn/"));
+        assert!(is_public("https://www.rust.ayypd.cn/"));
+        assert!(is_public("https://api.rust.ayypd.cn/v1"));
+        assert!(is_public("https://API.RUST.AYYPD.CN/v1"));
+        assert!(is_public("https://rust.ayypd.cn/path"));
 
-        // Test URLs ending with "rustdesk.com"
-        assert!(is_public("rustdesk.com"));
-        assert!(is_public("https://rustdesk.com"));
-        assert!(is_public("https://RustDesk.com"));
-        assert!(is_public("http://www.rustdesk.com"));
-        assert!(is_public("https://api.rustdesk.com"));
+        // Test URLs ending with "rust.ayypd.cn"
+        assert!(is_public("rust.ayypd.cn"));
+        assert!(is_public("https://rust.ayypd.cn"));
+        assert!(is_public("https://Rust.AYypd.cn"));
+        assert!(is_public("http://www.rust.ayypd.cn"));
+        assert!(is_public("https://api.rust.ayypd.cn"));
 
         // Test non-public URLs
         assert!(!is_public("https://example.com"));
         assert!(!is_public("https://custom-server.com"));
         assert!(!is_public("http://192.168.1.1"));
         assert!(!is_public("localhost"));
-        assert!(!is_public("https://rustdesk.computer.com"));
-        assert!(!is_public("rustdesk.comhello.com"));
+        assert!(!is_public("https://rustdesk.com"));
+        assert!(!is_public("https://rust.ayypd.cn.computer.com"));
+        assert!(!is_public("rust.ayypd.cnhello.com"));
     }
 
     #[test]
     fn test_is_public_matches_rustdesk_root_domain() {
-        assert!(is_public("rustdesk.com/"));
-        assert!(is_public("rustdesk.com:21117"));
-        assert!(is_public("api.rustdesk.com:21117"));
-        assert!(!is_public("hello-rustdesk.com"));
-        assert!(!is_public("api.rustdesk.com.evil.test"));
-        assert!(!is_public("https://rustdesk.com@evil.test"));
+        assert!(is_public("rust.ayypd.cn/"));
+        assert!(is_public("rust.ayypd.cn:21117"));
+        assert!(is_public("api.rust.ayypd.cn:21117"));
+        assert!(!is_public("hello-rust.ayypd.cn"));
+        assert!(!is_public("api.rust.ayypd.cn.evil.test"));
+        assert!(!is_public("https://rust.ayypd.cn@evil.test"));
     }
 
     #[test]
@@ -3057,8 +3058,8 @@ mod tests {
             "https://admin.example.com"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
-            "https://admin.rustdesk.com/api/login",
-            "https://admin.rustdesk.com"
+            "https://admin.rust.ayypd.cn/api/login",
+            "https://admin.rust.ayypd.cn"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
             "https://admin.example.com/api/login",
