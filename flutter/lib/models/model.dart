@@ -25,9 +25,6 @@ import 'package:flutter_hbb/models/user_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/models/desktop_render_texture.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
-import 'package:flutter_hbb/plugin/event.dart';
-import 'package:flutter_hbb/plugin/manager.dart';
-import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
@@ -55,6 +52,8 @@ import 'package:flutter_hbb/native/custom_cursor.dart'
 typedef HandleMsgBox = Function(Map<String, dynamic> evt, String id);
 typedef ReconnectHandle = Function(OverlayDialogManager, SessionID, bool);
 final _constSessionId = Uuid().v4obj();
+// Empirical restart reconnect cadence: keep the last frame briefly and retry quickly.
+const _restartReconnectSilentDelaySecs = 5;
 
 class CachedPeerData {
   Map<String, dynamic> updatePrivacyMode = {};
@@ -110,6 +109,9 @@ class CachedPeerData {
 class FfiModel with ChangeNotifier {
   CachedPeerData cachedPeerData = CachedPeerData();
   PeerInfo _pi = PeerInfo();
+  int? lastUserDisplay;
+  int? pendingMonitorRestore;
+  Timer? _pendingRestoreTimer;
   Rect? _rect;
 
   var _inputBlocked = false;
@@ -119,7 +121,11 @@ class FfiModel with ChangeNotifier {
   bool _touchMode = false;
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
+  Timer? _restartReconnectDelayTimer;
   var _reconnects = 1;
+  DateTime? _offlineReconnectStartTime;
+  bool _androidDocumentPickerActive = false;
+  bool _androidDocumentPickerInterruptedConnection = false;
   bool _viewOnly = false;
   bool _showMyCursor = false;
   WeakReference<FFI> parent;
@@ -213,6 +219,9 @@ class FfiModel with ChangeNotifier {
   }
 
   updatePermission(Map<String, dynamic> evt, String id) {
+    // Track previous keyboard permission to detect revocation.
+    final hadKeyboardPerm = _permissions['keyboard'] != false;
+
     evt.forEach((k, v) {
       if (k == 'name' || k.isEmpty) return;
       _permissions[k] = v == 'true';
@@ -221,6 +230,18 @@ class FfiModel with ChangeNotifier {
     if (parent.target?.connType == ConnType.defaultConn) {
       KeyboardEnabledState.find(id).value = _permissions['keyboard'] != false;
     }
+
+    // If keyboard permission was revoked while relative mouse mode is active,
+    // forcefully disable relative mouse mode to prevent the user from being trapped.
+    final hasKeyboardPerm = _permissions['keyboard'] != false;
+    if (hadKeyboardPerm && !hasKeyboardPerm) {
+      final inputModel = parent.target?.inputModel;
+      if (inputModel != null && inputModel.relativeMouseMode.value) {
+        inputModel.setRelativeMouseMode(false);
+        showToast(translate('rel-mouse-permission-lost-tip'));
+      }
+    }
+
     debugPrint('updatePermission: $_permissions');
     notifyListeners();
   }
@@ -229,11 +250,16 @@ class FfiModel with ChangeNotifier {
 
   clear() {
     _pi = PeerInfo();
+    lastUserDisplay = null;
+    _cancelPendingMonitorRestore();
     _secure = null;
     _direct = null;
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
+    _androidDocumentPickerActive = false;
+    _androidDocumentPickerInterruptedConnection = false;
+    resetRestartReconnectState();
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
@@ -325,6 +351,7 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'connection_ready') {
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
+        resetRestartReconnectState();
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
@@ -363,7 +390,7 @@ class FfiModel with ChangeNotifier {
           parent.target?.fileModel.refreshAll();
         }
       } else if (name == 'job_error') {
-        parent.target?.fileModel.jobController.jobError(evt);
+        parent.target?.fileModel.handleJobError(evt);
       } else if (name == 'override_file_confirm') {
         parent.target?.fileModel.postOverrideFileConfirm(evt);
       } else if (name == 'load_last_job') {
@@ -411,15 +438,6 @@ class FfiModel with ChangeNotifier {
         parent.target?.serverModel.updateVoiceCallState(evt);
       } else if (name == 'fingerprint') {
         FingerprintState.find(peerId).value = evt['fingerprint'] ?? '';
-      } else if (name == 'plugin_manager') {
-        pluginManager.handleEvent(evt);
-      } else if (name == 'plugin_event') {
-        handlePluginEvent(evt,
-            (Map<String, dynamic> e) => handleMsgBox(e, sessionId, peerId));
-      } else if (name == 'plugin_reload') {
-        handleReloading(evt);
-      } else if (name == 'plugin_option') {
-        handleOption(evt);
       } else if (name == "sync_peer_hash_password_to_personal_ab") {
         if (desktopType == DesktopType.main || isWeb || isMobile) {
           final id = evt['id'];
@@ -457,6 +475,9 @@ class FfiModel with ChangeNotifier {
         _handlePrinterRequest(evt, sessionId, peerId);
       } else if (name == 'screenshot') {
         _handleScreenshot(evt, sessionId, peerId);
+      } else if (name == 'exit_relative_mouse_mode') {
+        // Handle exit shortcut from rdev grab loop (Ctrl+Alt on Win/Linux, Cmd+G on macOS)
+        parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -765,7 +786,8 @@ class FfiModel with ChangeNotifier {
     }
   }
 
-  updateCurDisplay(SessionID sessionId, {updateCursorPos = false}) {
+  Future<void> updateCurDisplay(SessionID sessionId,
+      {updateCursorPos = false}) async {
     final newRect = displaysRect();
     if (newRect == null) {
       return;
@@ -777,9 +799,19 @@ class FfiModel with ChangeNotifier {
             updateCursorPos: updateCursorPos);
       }
       _rect = newRect;
-      parent.target?.canvasModel
+      // Await updateViewStyle to ensure view geometry is fully updated before
+      // updating pointer lock center. This prevents stale center calculations.
+      await parent.target?.canvasModel
           .updateViewStyle(refreshMousePos: updateCursorPos);
       _updateSessionWidthHeight(sessionId);
+
+      // Keep pointer lock center in sync when using relative mouse mode.
+      // Note: updatePointerLockCenter is async-safe (handles errors internally),
+      // so we fire-and-forget here.
+      final inputModel = parent.target?.inputModel;
+      if (inputModel != null && inputModel.relativeMouseMode.value) {
+        inputModel.updatePointerLockCenter();
+      }
     }
   }
 
@@ -863,26 +895,60 @@ class FfiModel with ChangeNotifier {
     final title = evt['title'];
     final text = evt['text'];
     final link = evt['link'];
+
+    if (isAndroid &&
+        _androidDocumentPickerActive &&
+        title == 'Connection Error') {
+      _androidDocumentPickerInterruptedConnection = true;
+      return;
+    }
+
+    // Disable relative mouse mode on any error-type message to ensure cursor is released.
+    // This includes connection errors, session-ending messages, elevation errors, etc.
+    // Safety: releasing pointer lock on errors prevents the user from being stuck.
+    if (title == 'Connection Error' ||
+        type == 'error' ||
+        type == 'restarting' ||
+        (type is String && type.contains('error'))) {
+      parent.target?.inputModel.setRelativeMouseMode(false);
+    }
+
     if (type == 're-input-password') {
       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
     } else if (type == 'input-2fa') {
       enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
       enterPasswordDialog(sessionId, dialogManager);
-    } else if (type == 'session-login' || type == 'session-re-login') {
-      enterUserLoginDialog(sessionId, dialogManager, 'login_linux_tip', true);
-    } else if (type == 'session-login-password') {
-      enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'login_linux_tip', true);
     } else if (type == 'terminal-admin-login') {
       enterUserLoginDialog(
-          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+          sessionId, dialogManager, 'terminal-admin-login-tip');
     } else if (type == 'terminal-admin-login-password') {
       enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+          sessionId, dialogManager, 'terminal-admin-login-tip');
     } else if (type == 'restarting') {
-      showMsgBox(sessionId, type, title, text, link, false, dialogManager,
-          hasCancel: false);
+      // Treat restart messages as reconnect control events. Rust still sends
+      // title/text for legacy UI and translation reuse; Flutter keeps the last
+      // frame briefly, then shows the Connecting overlay.
+      if (_restartReconnectDelayTimer == null) {
+        parent.target?.inputModel.setRelativeMouseMode(false);
+        _cancelPendingMonitorRestore();
+        bind.sessionReconnect(sessionId: sessionId, forceRelay: false);
+        clearPermissions();
+        // Retry once more after the silent window so restart reconnect attempts
+        // are spaced by the empirical short cadence instead of only updating UI.
+        _restartReconnectDelayTimer =
+            Timer(Duration(seconds: _restartReconnectSilentDelaySecs), () {
+          _restartReconnectDelayTimer = null;
+          if (parent.target?.closed == true) {
+            return;
+          }
+          reconnect(dialogManager, sessionId, false);
+        });
+      }
+    } else if (type == 'restarting-show') {
+      _restartReconnectDelayTimer?.cancel();
+      _restartReconnectDelayTimer = null;
+      reconnect(dialogManager, sessionId, false);
     } else if (type == 'wait-remote-accept-nook') {
       showWaitAcceptDialog(sessionId, type, title, text, dialogManager);
     } else if (type == 'on-uac' || type == 'on-foreground-elevated') {
@@ -900,9 +966,66 @@ class FfiModel with ChangeNotifier {
       showPrivacyFailedDialog(
           sessionId, type, title, text, link, hasRetry, dialogManager);
     } else {
-      final hasRetry = evt['hasRetry'] == 'true';
+      var hasRetry = evt['hasRetry'] == 'true';
+      if (!hasRetry) {
+        hasRetry = shouldAutoRetryOnOffline(type, title, text);
+      }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
+  }
+
+  void resetRestartReconnectState() {
+    _restartReconnectDelayTimer?.cancel();
+    _restartReconnectDelayTimer = null;
+  }
+
+  void beginAndroidDocumentPicker() {
+    if (!isAndroid) return;
+    _androidDocumentPickerActive = true;
+    _androidDocumentPickerInterruptedConnection = false;
+  }
+
+  void endAndroidDocumentPicker() {
+    if (!isAndroid) return;
+    _androidDocumentPickerActive = false;
+    if (!_androidDocumentPickerInterruptedConnection ||
+        parent.target?.closed == true) {
+      return;
+    }
+    _androidDocumentPickerInterruptedConnection = false;
+    reconnect(parent.target!.dialogManager, sessionId, false);
+  }
+
+  /// Auto-retry check for "Remote desktop is offline" error.
+  /// returns true to auto-retry, false otherwise.
+  bool shouldAutoRetryOnOffline(
+    String type,
+    String title,
+    String text,
+  ) {
+    if (type == 'error' &&
+        title == 'Connection Error' &&
+        text == 'Remote desktop is offline' &&
+        _pi.isSet.isTrue) {
+      // Auto retry for ~30s (server's peer offline threshold) when controlled peer's account changes
+      // (e.g., signout, switch user, login into OS) causes temporary offline via websocket/tcp connection.
+      // The actual wait may exceed 30s (e.g., 20s elapsed + 16s next retry = 36s), which is acceptable
+      // since the controlled side reconnects quickly after account changes.
+      // Uses time-based check instead of _reconnects count because user can manually retry.
+      // https://github.com/rustdesk/rustdesk/discussions/14048
+      if (_offlineReconnectStartTime == null) {
+        // First offline, record time and start retry
+        _offlineReconnectStartTime = DateTime.now();
+        return true;
+      } else {
+        final elapsed =
+            DateTime.now().difference(_offlineReconnectStartTime!).inSeconds;
+        if (elapsed < 30) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   handleToast(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
@@ -940,19 +1063,31 @@ class FfiModel with ChangeNotifier {
   showMsgBox(SessionID sessionId, String type, String title, String text,
       String link, bool hasRetry, OverlayDialogManager dialogManager,
       {bool? hasCancel}) async {
-    final showNoteEdit = parent.target != null &&
+    final noteAllowed = parent.target != null &&
         allowAskForNoteAtEndOfConnection(parent.target, false) &&
-        (title == "Connection Error" || type == "restarting") &&
-        !hasRetry;
+        (title == "Connection Error" || type == "restarting");
+    final showNoteEdit = noteAllowed && !hasRetry;
     if (showNoteEdit) {
       await showConnEndAuditDialogCloseCanceled(
           ffi: parent.target!, type: type, title: title, text: text);
       closeConnection();
     } else {
+      VoidCallback? onSubmit;
+      if (noteAllowed && hasRetry) {
+        final ffi = parent.target!;
+        onSubmit = () async {
+          _timer?.cancel();
+          _timer = null;
+          await showConnEndAuditDialogCloseCanceled(
+              ffi: ffi, type: type, title: title, text: text);
+          closeConnection();
+        };
+      }
       msgBox(sessionId, type, title, text, link, dialogManager,
           hasCancel: hasCancel,
           reconnect: hasRetry ? reconnect : null,
-          reconnectTimeout: hasRetry ? _reconnects : null);
+          reconnectTimeout: hasRetry ? _reconnects : null,
+          onSubmit: onSubmit);
     }
     _timer?.cancel();
     if (hasRetry) {
@@ -962,11 +1097,26 @@ class FfiModel with ChangeNotifier {
       _reconnects *= 2;
     } else {
       _reconnects = 1;
+      _offlineReconnectStartTime = null;
     }
+  }
+
+  void _cancelPendingMonitorRestore() {
+    _pendingRestoreTimer?.cancel();
+    _pendingRestoreTimer = null;
+    pendingMonitorRestore = null;
+  }
+
+  void cancelPendingRestoreTimer() {
+    _pendingRestoreTimer?.cancel();
+    _pendingRestoreTimer = null;
   }
 
   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
       bool forceRelay) {
+    // Disable relative mouse mode before reconnecting to ensure cursor is released.
+    parent.target?.inputModel.setRelativeMouseMode(false);
+    _cancelPendingMonitorRestore();
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
     dialogManager.dismissAll();
@@ -1081,7 +1231,8 @@ class FfiModel with ChangeNotifier {
       if (displays.length == 1) {
         bind.sessionSetSize(
           sessionId: sessionId,
-          display: pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
+          display:
+              pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
           width: displays[0].width,
           height: displays[0].height,
         );
@@ -1100,6 +1251,14 @@ class FfiModel with ChangeNotifier {
 
   void _queryAuditGuid(String peerId) async {
     try {
+      if (bind.isDisableAccount()) {
+        return;
+      }
+      if (bind
+          .sessionGetAuditServerSync(sessionId: sessionId, typ: "conn/active")
+          .isEmpty) {
+        return;
+      }
       if (!mainGetLocalBoolOptionSync(
           kOptionAllowAskForNoteAtEndOfConnection)) {
         return;
@@ -1183,9 +1342,6 @@ class FfiModel with ChangeNotifier {
 
     _queryAuditGuid(peerId);
 
-    // This call is to ensuer the keyboard mode is updated depending on the peer version.
-    parent.target?.inputModel.updateKeyboardMode();
-
     // Map clone is required here, otherwise "evt" may be changed by other threads through the reference.
     // Because this function is asynchronous, there's an "await" in this function.
     cachedPeerData.peerInfo = {...evt};
@@ -1197,6 +1353,17 @@ class FfiModel with ChangeNotifier {
 
     parent.target?.dialogManager.dismissAll();
     _pi.version = evt['version'];
+    // Note: Relative mouse mode is NOT auto-enabled on connect.
+    // Users must manually enable it via toolbar or keyboard shortcut (Ctrl+Alt+Shift+M).
+    //
+    // For desktop/webDesktop, keyboard mode initialization is handled later by
+    // checkDesktopKeyboardMode() which may change the mode if not supported,
+    // followed by updateKeyboardMode() to sync InputModel.keyboardMode.
+    // For mobile, updateKeyboardMode() is currently a no-op (only executes on desktop/web),
+    // but we call it here for consistency and future-proofing.
+    if (isMobile) {
+      parent.target?.inputModel.updateKeyboardMode();
+    }
     _pi.isSupportMultiUiSession =
         bind.isSupportMultiUiSession(version: _pi.version);
     _pi.username = evt['username'];
@@ -1263,8 +1430,29 @@ class FfiModel with ChangeNotifier {
         // now replaced to _updateCurDisplay
         updateCurDisplay(sessionId);
       }
+      // After reconnecting, restore the last selected monitor once the canvas is ready.
+      // Switching earlier can offset the view if the monitor sizes differ.
+      final last = lastUserDisplay;
+      pendingMonitorRestore = (!isCache &&
+              last != null &&
+              last != currentDisplay &&
+              bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
+                      sessionId: sessionId) !=
+                  'Y' &&
+              ((last == kAllDisplayValue && _pi.displays.isNotEmpty) ||
+                  (last >= 0 && last < _pi.displays.length)))
+          ? last
+          : null;
+      // Fallback if the first image event never reaches this tab (multi-UI).
+      _pendingRestoreTimer?.cancel();
+      if (pendingMonitorRestore != null) {
+        _pendingRestoreTimer = Timer(const Duration(milliseconds: 1500),
+            () => parent.target?._applyPendingMonitorRestore());
+      }
       if (displays.isNotEmpty) {
         _reconnects = 1;
+        _offlineReconnectStartTime = null;
+        resetRestartReconnectState();
         waitForFirstImage.value = true;
         isRefreshing = false;
       }
@@ -1298,7 +1486,11 @@ class FfiModel with ChangeNotifier {
     stateGlobal.resetLastResolutionGroupValues(peerId);
 
     if (isDesktop || isWebDesktop) {
-      checkDesktopKeyboardMode();
+      // checkDesktopKeyboardMode may change the keyboard mode if the current
+      // mode is not supported. Re-sync InputModel.keyboardMode afterwards.
+      // Note: updateKeyboardMode() is a no-op on mobile (early-returns).
+      await checkDesktopKeyboardMode();
+      await parent.target?.inputModel.updateKeyboardMode();
     }
 
     notifyListeners();
@@ -1771,6 +1963,12 @@ class ImageModel with ChangeNotifier {
     platformFFI.nextRgba(sessionId, display);
   }
 
+  // web only: image already created from a decoded WebCodecs frame
+  Future<void> onImage(
+      int display, ui.Image image, bool Function() isCurrentSession) async {
+    await update(image, isCurrentSession: isCurrentSession);
+  }
+
   decodeAndUpdate(int display, Uint8List rgba) async {
     final pid = parent.target?.id;
     final rect = parent.target?.ffiModel.pi.getDisplayRect(display);
@@ -1782,11 +1980,16 @@ class ImageModel with ChangeNotifier {
           ? ui.PixelFormat.rgba8888
           : ui.PixelFormat.bgra8888,
     );
-    if (parent.target?.id != pid) return;
+    if (parent.target?.id != pid) {
+      image?.dispose();
+      return;
+    }
     await update(image);
   }
 
-  update(ui.Image? image) async {
+  Future<void> update(ui.Image? image,
+      {bool Function()? isCurrentSession}) async {
+    if (_disposeIfStale(image, isCurrentSession)) return;
     if (_image == null && image != null) {
       if (isDesktop || isWebDesktop) {
         await parent.target?.canvasModel.updateViewStyle();
@@ -1797,9 +2000,17 @@ class ImageModel with ChangeNotifier {
         await initializeCursorAndCanvas(parent.target!);
       }
     }
+    if (_disposeIfStale(image, isCurrentSession)) return;
     _image?.dispose();
     _image = image;
     if (image != null) notifyListeners();
+  }
+
+  bool _disposeIfStale(ui.Image? image, bool Function()? isCurrentSession) {
+    if (image == null || isCurrentSession == null) return false;
+    if (isCurrentSession()) return false;
+    image.dispose();
+    return true;
   }
 
   // mobile only
@@ -2025,6 +2236,7 @@ class CanvasModel with ChangeNotifier {
   double _y = 0;
   // image scale
   double _scale = 1.0;
+  bool _locked = false;
   double _devicePixelRatio = 1.0;
   Size _size = Size.zero;
   // the tabbar over the image
@@ -2051,6 +2263,9 @@ class CanvasModel with ChangeNotifier {
   ViewStyle _lastViewStyle = ViewStyle.defaultViewStyle();
 
   Timer? _timerMobileFocusCanvasCursor;
+  Timer? _timerMobileRestoreCanvasOffset;
+  Offset? _offsetBeforeMobileSoftKeyboard;
+  double? _scaleBeforeMobileSoftKeyboard;
 
   // `isMobileCanvasChanged` is used to avoid canvas reset when changing the input method
   // after showing the soft keyboard.
@@ -2070,11 +2285,18 @@ class CanvasModel with ChangeNotifier {
   double get x => _x;
   double get y => _y;
   double get scale => _scale;
+  bool get locked => _locked;
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
   ViewStyle get viewStyle => _lastViewStyle;
   RxBool get imageOverflow => _imageOverflow;
+
+  void setLocked(bool value) {
+    if (_locked == value) return;
+    _locked = value;
+    notifyListeners();
+  }
 
   _resetScroll() => setScrollPercent(0.0, 0.0);
 
@@ -2114,10 +2336,32 @@ class CanvasModel with ChangeNotifier {
     double w = size.width - leftToEdge - rightToEdge;
     double h = size.height - topToEdge - bottomToEdge;
     if (isMobile) {
+      // Account for horizontal safe area insets on both orientations.
+      w = w - mediaData.padding.left - mediaData.padding.right;
+      // Vertically, subtract the bottom keyboard inset (viewInsets.bottom) and any
+      // bottom overlay (e.g. key-help tools) so the canvas is not covered.
       h = h -
           mediaData.viewInsets.bottom -
           (parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ??
               0);
+      // Orientation-specific handling:
+      //  - Portrait: additionally subtract top padding (e.g. status bar / notch)
+      //  - Landscape: does not subtract mediaData.padding.top/bottom (home indicator auto-hides)
+      final isPortrait = size.height > size.width;
+      if (isPortrait) {
+        // In portrait mode, subtract the top safe-area padding (e.g. status bar / notch)
+        // so the remote image is not truncated, while keeping the bottom inset to avoid
+        // introducing unnecessary blank space around the canvas.
+        //
+        // iOS -> Android, portrait, adjust mode:
+        // h = h (no padding subtracted): top and bottom are truncated
+        //   https://github.com/user-attachments/assets/30ed4559-c27e-432b-847f-8fec23c9f998
+        // h = h - top - bottom: extra blank spaces appear
+        //   https://github.com/user-attachments/assets/12a98817-3b4e-43aa-be0f-4b03cf364b7e
+        // h = h - top (current): works fine
+        //   https://github.com/user-attachments/assets/95f047f2-7f47-4a36-8113-5023989a0c81
+        h = h - mediaData.padding.top;
+      }
     }
     return Size(w < 0 ? 0 : w, h < 0 ? 0 : h);
   }
@@ -2282,6 +2526,7 @@ class CanvasModel with ChangeNotifier {
   }
 
   void updateLocalCursor(double x, double y) {
+    if (parent.target?.ffiModel.viewOnly == true) return;
     // If keyboard is not permitted, do not move cursor when mouse is moving.
     if (parent.target != null && parent.target!.ffiModel.keyboard) {
       // Draw cursor if is not desktop.
@@ -2514,8 +2759,12 @@ class CanvasModel with ChangeNotifier {
     _x = 0;
     _y = 0;
     _scale = 1.0;
+    _locked = false;
     _lastViewStyle = ViewStyle.defaultViewStyle();
     _timerMobileFocusCanvasCursor?.cancel();
+    _timerMobileRestoreCanvasOffset?.cancel();
+    _offsetBeforeMobileSoftKeyboard = null;
+    _scaleBeforeMobileSoftKeyboard = null;
   }
 
   updateScrollPercent() {
@@ -2540,6 +2789,31 @@ class CanvasModel with ChangeNotifier {
         Timer(Duration(milliseconds: 100), () async {
       updateSize();
       _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
+      notifyListeners();
+    });
+  }
+
+  void saveMobileOffsetBeforeSoftKeyboard() {
+    _timerMobileRestoreCanvasOffset?.cancel();
+    _offsetBeforeMobileSoftKeyboard = Offset(_x, _y);
+    _scaleBeforeMobileSoftKeyboard = _scale;
+  }
+
+  void restoreMobileOffsetAfterSoftKeyboard() {
+    _timerMobileRestoreCanvasOffset?.cancel();
+    _timerMobileFocusCanvasCursor?.cancel();
+    final targetOffset = _offsetBeforeMobileSoftKeyboard;
+    final targetScale = _scaleBeforeMobileSoftKeyboard;
+    if (targetOffset == null || targetScale == null) {
+      return;
+    }
+    _timerMobileRestoreCanvasOffset = Timer(Duration(milliseconds: 100), () {
+      updateSize();
+      _x = targetOffset.dx;
+      _y = targetOffset.dy;
+      _scale = targetScale;
+      _offsetBeforeMobileSoftKeyboard = null;
+      _scaleBeforeMobileSoftKeyboard = null;
       notifyListeners();
     });
   }
@@ -2597,7 +2871,7 @@ class CursorData {
     required this.width,
     required this.height,
   })  : hotx = hotxOrigin * scale,
-        hoty = hotxOrigin * scale;
+        hoty = hotyOrigin * scale;
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
@@ -2796,8 +3070,13 @@ class CursorModel with ChangeNotifier {
       _lastIsBlocked = true;
     }
     if (isMobile && _lastKeyboardIsVisible != keyboardIsVisible) {
-      parent.target?.canvasModel.mobileFocusCanvasCursor();
-      parent.target?.canvasModel.isMobileCanvasChanged = false;
+      if (keyboardIsVisible) {
+        parent.target?.canvasModel.saveMobileOffsetBeforeSoftKeyboard();
+        parent.target?.canvasModel.mobileFocusCanvasCursor();
+        parent.target?.canvasModel.isMobileCanvasChanged = false;
+      } else {
+        parent.target?.canvasModel.restoreMobileOffsetAfterSoftKeyboard();
+      }
     }
     _lastKeyboardIsVisible = keyboardIsVisible;
   }
@@ -3318,6 +3597,16 @@ class QualityMonitorModel with ChangeNotifier {
   bool get show => _show;
   QualityMonitorData get data => _data;
 
+  // Only a WebRTC session names its transport here: web has no session tab
+  // to show it on, and WebRTC is the one path that can be direct or TURN.
+  String? get webrtcTransport {
+    final ffiModel = parent.target?.ffiModel;
+    if (ffiModel == null) return null;
+    final streamType = ffiModel.cachedPeerData.streamType;
+    if (!streamType.startsWith('WebRTC')) return null;
+    return ffiModel.direct == false ? '$streamType (TURN)' : streamType;
+  }
+
   checkShowQualityMonitor(SessionID sessionId) async {
     final show = await bind.sessionGetToggleOption(
             sessionId: sessionId, arg: 'show-quality-monitor') ==
@@ -3495,6 +3784,7 @@ class FFI {
 
   /// Mobile reuse FFI
   void mobileReset() {
+    ffiModel.resetRestartReconnectState();
     ffiModel.waitForFirstImage.value = true;
     ffiModel.isRefreshing = false;
     ffiModel.waitForImageDialogShow.value = true;
@@ -3613,6 +3903,15 @@ class FFI {
         onEvent2UIRgba();
         imageModel.onRgba(display, data);
       });
+      platformFFI.setVideoFrameCallback((int display, ui.Image image,
+          bool Function() isCurrentSession) async {
+        if (!isCurrentSession()) {
+          image.dispose();
+          return;
+        }
+        await onEvent2UIRgba();
+        await imageModel.onImage(display, image, isCurrentSession);
+      });
       this.id = id;
       return;
     }
@@ -3700,7 +3999,7 @@ class FFI {
     this.id = id;
   }
 
-  void onEvent2UIRgba() async {
+  Future<void> onEvent2UIRgba() async {
     if (ffiModel.waitForImageDialogShow.isTrue) {
       ffiModel.waitForImageDialogShow.value = false;
       ffiModel.waitForImageTimer?.cancel();
@@ -3708,13 +4007,32 @@ class FFI {
     }
     if (ffiModel.waitForFirstImage.value == true) {
       ffiModel.waitForFirstImage.value = false;
+      ffiModel.cancelPendingRestoreTimer();
+      ffiModel.resetRestartReconnectState();
       dialogManager.dismissAll();
-      await canvasModel.updateViewStyle();
-      await canvasModel.updateScrollStyle();
-      await canvasModel.initializeEdgeScrollEdgeThickness();
-      for (final cb in imageModel.callbacksOnFirstImage) {
-        cb(id);
+      try {
+        await canvasModel.updateViewStyle();
+        await canvasModel.updateScrollStyle();
+        await canvasModel.initializeEdgeScrollEdgeThickness();
+        for (final cb in imageModel.callbacksOnFirstImage) {
+          cb(id);
+        }
+      } finally {
+        _applyPendingMonitorRestore();
       }
+    }
+  }
+
+  void _applyPendingMonitorRestore() {
+    final restore = ffiModel.pendingMonitorRestore;
+    ffiModel._cancelPendingMonitorRestore();
+    if (restore == null || closed) return;
+    // The display list may have changed since the restore was queued.
+    final displays = ffiModel.pi.displays;
+    if ((restore == kAllDisplayValue && displays.isNotEmpty) ||
+        (restore >= 0 && restore < displays.length)) {
+      openMonitorInTheSameTab(restore, this, ffiModel.pi,
+          recordSelection: false, updateCursorPos: false);
     }
   }
 
@@ -3737,6 +4055,9 @@ class FFI {
   /// Close the remote session.
   Future<void> close({bool closeSession = true}) async {
     closed = true;
+    if (isWeb) {
+      platformFFI.clearVideoFrameCallback();
+    }
     chatModel.close();
     // Close all terminal models
     for (final model in _terminalModels.values) {
@@ -3759,6 +4080,9 @@ class FFI {
     ffiModel.clear();
     canvasModel.clear();
     inputModel.resetModifiers();
+    // Dispose relative mouse mode resources to ensure cursor is restored
+    inputModel.disposeRelativeMouseMode();
+    inputModel.disposeSideButtonTracking();
     if (closeSession) {
       await bind.sessionClose(sessionId: sessionId);
     }
@@ -3772,6 +4096,11 @@ class FFI {
 
   Future<bool> invokeMethod(String method, [dynamic arguments]) async {
     return await platformFFI.invokeMethod(method, arguments);
+  }
+
+  Future<T?> invokeMethodWithResult<T>(String method,
+      [dynamic arguments]) async {
+    return await platformFFI.invokeMethodWithResult<T>(method, arguments);
   }
 
   // Terminal model management
@@ -3878,7 +4207,6 @@ class PeerInfo with ChangeNotifier {
   RxBool isSet = false.obs;
 
   bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
-  bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
   bool get isInstalled =>
       platform != kPeerPlatformWindows ||
       platformAdditions[kPlatformAdditionsIsInstalled] == true;

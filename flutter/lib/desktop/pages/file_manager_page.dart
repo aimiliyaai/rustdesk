@@ -17,7 +17,6 @@ import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter_hbb/web/dummy.dart'
     if (dart.library.html) 'package:flutter_hbb/web/web_unique.dart';
 
@@ -86,6 +85,7 @@ class _FileManagerPageState extends State<FileManagerPage>
 
   final _dropMaskVisible = false.obs; // TODO impl drop mask
   final _overlayKeyState = OverlayKeyState();
+  final _uniqueKey = UniqueKey();
 
   late FFI _ffi;
 
@@ -107,9 +107,7 @@ class _FileManagerPageState extends State<FileManagerPage>
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
     Get.put<FFI>(_ffi, tag: 'ft_${widget.id}');
-    if (!isLinux) {
-      WakelockPlus.enable();
-    }
+    WakelockManager.enable(_uniqueKey);
     if (isWeb) {
       _ffi.ffiModel.updateEventListener(_ffi.sessionId, widget.id);
     }
@@ -127,9 +125,7 @@ class _FileManagerPageState extends State<FileManagerPage>
     model.close().whenComplete(() {
       _ffi.close();
       _ffi.dialogManager.dismissAll();
-      if (!isLinux) {
-        WakelockPlus.disable();
-      }
+      WakelockManager.disable(_uniqueKey);
       Get.delete<FFI>(tag: 'ft_${widget.id}');
     });
     WidgetsBinding.instance.removeObserver(this);
@@ -282,11 +278,41 @@ class _FileManagerPageState extends State<FileManagerPage>
                                     item.state != JobState.inProgress,
                                 child: LinearPercentIndicator(
                                   animateFromLastPercent: true,
-                                  center: Text(
-                                    '${(item.finishedSize / item.totalSize * 100).toStringAsFixed(0)}%',
+                                  center: SizedBox.expand(
+                                    child: ShaderMask(
+                                      blendMode: BlendMode.srcATop,
+                                      shaderCallback: (bounds) =>
+                                          LinearGradient(
+                                        colors: [
+                                          Colors.white,
+                                          Colors.transparent,
+                                        ],
+                                        stops: [item.percent, item.percent],
+                                      ).createShader(bounds),
+                                      child: FittedBox(
+                                        fit: BoxFit.scaleDown,
+                                        child: Text.rich(
+                                          TextSpan(
+                                            text: item.percentText,
+                                            children: [
+                                              if (item.recvJobRes)
+                                                TextSpan(
+                                                  text:
+                                                      ' ${readableFileSize(item.speed)}/s',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w300,
+                                                    color: MyTheme.darkGray,
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
                                   ),
                                   barRadius: Radius.circular(15),
-                                  percent: item.finishedSize / item.totalSize,
+                                  percent: item.percent,
                                   progressColor: MyTheme.accent,
                                   backgroundColor: Theme.of(context).hoverColor,
                                   lineHeight: kDesktopFileTransferRowHeight,
@@ -1100,6 +1126,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                 return element.name.contains(_searchText.value);
               }).toList(growable: false)
             : entries;
+        // Keep rows lazy so large directories only build visible list items.
         final rows = filteredEntries.map((entry) {
           final sizeStr =
               entry.isFile ? readableFileSize(entry.size.toDouble()) : "";
@@ -1282,7 +1309,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                   ],
                 ))),
           );
-        }).toList(growable: false);
+        });
 
         return Column(
           children: [
@@ -1298,7 +1325,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                 controller: scrollController,
                 itemExtent: kDesktopFileTransferRowHeight,
                 itemBuilder: (context, index) {
-                  return rows[index];
+                  return rows.elementAt(index);
                 },
                 itemCount: rows.length,
               ),
