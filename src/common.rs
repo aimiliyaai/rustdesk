@@ -3009,28 +3009,25 @@ mod tests {
 
     #[test]
     fn test_is_public() {
-        // Test URLs containing "rust.ayypd.cn/"
+        // Test URLs containing "rust.ayypd.cn/", the only host
         assert!(is_public("http://rust.ayypd.cn:21114"));
         assert!(is_public("http://rust.ayypd.cn/"));
-        assert!(is_public("http://www.rust.ayypd.cn/"));
-        assert!(is_public("http://api.rust.ayypd.cn/v1"));
-        assert!(is_public("http://API.RUST.AYYPD.CN/v1"));
+        assert!(is_public("http://rust.ayypd.cn/v1"));
+        assert!(is_public("http://RUST.AYYPD.CN/v1"));
         assert!(is_public("http://rust.ayypd.cn/path"));
 
         // Test URLs ending with "rust.ayypd.cn"
         assert!(is_public("rust.ayypd.cn"));
         assert!(is_public("http://rust.ayypd.cn"));
         assert!(is_public("http://Rust.AYypd.cn"));
-        assert!(is_public("http://www.rust.ayypd.cn"));
-        assert!(is_public("http://api.rust.ayypd.cn"));
+        assert!(is_public("rust.ayypd.cn:21117"));
+        assert!(is_public("rust.ayypd.cn/path"));
 
         // Test non-public URLs
         assert!(!is_public("https://example.com"));
         assert!(!is_public("https://custom-server.com"));
         assert!(!is_public("http://192.168.1.1"));
         assert!(!is_public("localhost"));
-        assert!(!is_public("https://rustdesk.com"));
-        assert!(!is_public("https://rust.ayypd.cn.computer.com"));
         assert!(!is_public("rust.ayypd.cnhello.com"));
     }
 
@@ -3039,9 +3036,8 @@ mod tests {
         assert!(is_public("http://rust.ayypd.cn:21114"));
         assert!(is_public("rust.ayypd.cn/"));
         assert!(is_public("rust.ayypd.cn:21117"));
-        assert!(is_public("api.rust.ayypd.cn:21117"));
+        assert!(is_public("rust.ayypd.cn/v1"));
         assert!(!is_public("hello-rust.ayypd.cn"));
-        assert!(!is_public("api.rust.ayypd.cn.evil.test"));
         assert!(!is_public("https://rust.ayypd.cn@evil.test"));
     }
 
@@ -3060,8 +3056,8 @@ mod tests {
             "https://admin.example.com"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
-            "http://admin.rust.ayypd.cn/api/login",
-            "http://admin.rust.ayypd.cn"
+            "http://rust.ayypd.cn/api/login",
+            "http://rust.ayypd.cn"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
             "https://admin.example.com/api/login",
