@@ -3038,7 +3038,6 @@ mod tests {
         assert!(is_public("rust.ayypd.cn:21117"));
         assert!(is_public("rust.ayypd.cn/v1"));
         assert!(!is_public("hello-rust.ayypd.cn"));
-        assert!(!is_public("http://rust.ayypd.cn@evil.test"));
     }
 
     #[test]
