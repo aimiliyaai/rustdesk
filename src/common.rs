@@ -1006,7 +1006,7 @@ pub fn check_software_update() {
 }
 
 // No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
+// Because the url is always `http://rust.ayypd.cn:21114/version/latest`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let (request, url) =
@@ -3010,18 +3010,19 @@ mod tests {
     #[test]
     fn test_is_public() {
         // Test URLs containing "rust.ayypd.cn/"
-        assert!(is_public("https://rust.ayypd.cn/"));
-        assert!(is_public("https://www.rust.ayypd.cn/"));
-        assert!(is_public("https://api.rust.ayypd.cn/v1"));
-        assert!(is_public("https://API.RUST.AYYPD.CN/v1"));
-        assert!(is_public("https://rust.ayypd.cn/path"));
+        assert!(is_public("http://rust.ayypd.cn:21114"));
+        assert!(is_public("http://rust.ayypd.cn/"));
+        assert!(is_public("http://www.rust.ayypd.cn/"));
+        assert!(is_public("http://api.rust.ayypd.cn/v1"));
+        assert!(is_public("http://API.RUST.AYYPD.CN/v1"));
+        assert!(is_public("http://rust.ayypd.cn/path"));
 
         // Test URLs ending with "rust.ayypd.cn"
         assert!(is_public("rust.ayypd.cn"));
-        assert!(is_public("https://rust.ayypd.cn"));
-        assert!(is_public("https://Rust.AYypd.cn"));
+        assert!(is_public("http://rust.ayypd.cn"));
+        assert!(is_public("http://Rust.AYypd.cn"));
         assert!(is_public("http://www.rust.ayypd.cn"));
-        assert!(is_public("https://api.rust.ayypd.cn"));
+        assert!(is_public("http://api.rust.ayypd.cn"));
 
         // Test non-public URLs
         assert!(!is_public("https://example.com"));
@@ -3034,7 +3035,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_public_matches_rustdesk_root_domain() {
+    fn test_is_public_matches_ayypd_root_domain() {
+        assert!(is_public("http://rust.ayypd.cn:21114"));
         assert!(is_public("rust.ayypd.cn/"));
         assert!(is_public("rust.ayypd.cn:21117"));
         assert!(is_public("api.rust.ayypd.cn:21117"));
@@ -3058,8 +3060,8 @@ mod tests {
             "https://admin.example.com"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
-            "https://admin.rust.ayypd.cn/api/login",
-            "https://admin.rust.ayypd.cn"
+            "http://admin.rust.ayypd.cn/api/login",
+            "http://admin.rust.ayypd.cn"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
             "https://admin.example.com/api/login",
